@@ -10,6 +10,15 @@ authors = "${mod_author}"
 credits = "${credits}"
 description = '''${description}'''
 
+[[mixins]]
+config = "${mod_id}.mixins.json"
+
+[[mixins]]
+config = "${mod_id}.21.mixins.json"
+
+[[mixins]]
+config = "${mod_id}.neoforge.mixins.json"
+
 [[dependencies.${mod_id}]]
 modId = "neoforge"
 type = "required"

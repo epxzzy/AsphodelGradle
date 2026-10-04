@@ -50,8 +50,9 @@ minecraft {
 
 mixin {
     config("${project.mod_id}.mixins.json")
+    config("${project.mod_id}.20.mixins.json")
+    config("${project.mod_id}.forge.mixins.json")
 }
-
 jar {
     manifest {
         attributes["MixinConfigs"] = "${project.mod_id}.mixins.json"

@@ -8,6 +8,11 @@
     "${mod_author}"
   ],
   "license": "${license}",
+  "mixins": [
+    "${mod_id}.mixins.json",
+    "${mod_id}.20.mixins.json",
+    "${mod_id}.fabric.mixins.json"
+  ],
   "environment": "*",
   "entrypoints": {
     "main": [
