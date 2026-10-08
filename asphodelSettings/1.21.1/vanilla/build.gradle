@@ -3,6 +3,11 @@ plugins {
     id 'fabric-loom'
 }
 
+asphodel {
+    loader = 'vanilla'
+    version = '1.21.1'
+}
+
 dependencies {
     minecraft "com.mojang:minecraft:${project.property('mc_1_21_1')}"
     mappings loom.layered {

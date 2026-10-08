@@ -1,5 +1,9 @@
 package asphodel.gradle;
 
+import asphodel.gradle.directives.MergeDirective;
+import asphodel.gradle.directives.PatchDirective;
+import asphodel.gradle.transformers.ImportTransformer;
+import asphodel.gradle.transformers.PatchTransformer;
 import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import org.gradle.api.DefaultTask;
@@ -41,15 +45,17 @@ import java.util.stream.Stream;
 @CacheableTask
 public abstract class AssembleSourcesTask extends DefaultTask {
 
-    private static final Pattern DIRECTIVE_PATTERN = Pattern.compile(
-            "^\\s*//\\s*asphodel::merge\\s*->\\s*loader\\s*=\\s*([A-Za-z_*]+)\\s*,\\s*version\\s*=\\s*([A-Za-z0-9._-]+|\\*)\\s*->\\s*([A-Za-z_][A-Za-z0-9_.]*)\\s*$",
-            Pattern.MULTILINE);
+    private static final Pattern MERGE_DIRECTIVE_PATTERN = Pattern.compile(
+            "^\\s*//\\s*asphodel::merge\\s*->\\s*(.+?)\\s*$");
 
     private static final Pattern PACKAGE_PATTERN = Pattern.compile(
             "^\\s*package\\s+([A-Za-z_][A-Za-z0-9_.]*)\\s*;",
             Pattern.MULTILINE);
 
-    private static final int STATE_VERSION = 2;
+    private static final Pattern FULLY_QUALIFIED_NAME_PATTERN = Pattern.compile(
+            "^[A-Za-z_][A-Za-z0-9_.]*$");
+
+    private static final int STATE_VERSION = 4;
 
     @InputFiles
     @Incremental
@@ -88,50 +94,48 @@ public abstract class AssembleSourcesTask extends DefaultTask {
 
     @TaskAction
     public void execute(InputChanges inputChanges) throws IOException {
-        Path outJava = getOutputJavaDir().get().getAsFile().toPath();
-        Path outRes = getOutputResourcesDir().get().getAsFile().toPath();
-        Path statePath = getStateFile().get().getAsFile().toPath();
-        Path base = getProjectDirectory().get().getAsFile().toPath().toAbsolutePath().normalize();
+        Path outputJavaDirectory = getOutputJavaDir().get().getAsFile().toPath();
+        Path outputResourcesDirectory = getOutputResourcesDir().get().getAsFile().toPath();
+        Path stateFilePath = getStateFile().get().getAsFile().toPath();
+        Path projectBasePath = getProjectDirectory().get().getAsFile().toPath().toAbsolutePath().normalize();
 
-        State previous = inputChanges.isIncremental() ? State.load(statePath, base) : null;
-        State current;
+        SourceState previousState = inputChanges.isIncremental() ? SourceState.load(stateFilePath, projectBasePath) : null;
+        SourceState currentState;
 
-        if (previous == null) {
-            clearDirectory(outJava);
-            clearDirectory(outRes);
-            Files.createDirectories(outJava);
-            Files.createDirectories(outRes);
-            current = scanAll();
-            applyResources(outRes);
-            rebuildAll(current, outJava);
+        if (previousState == null) {
+            clearDirectory(outputJavaDirectory);
+            clearDirectory(outputResourcesDirectory);
+            Files.createDirectories(outputJavaDirectory);
+            Files.createDirectories(outputResourcesDirectory);
+            currentState = scanAllSources();
+            applyResources(outputResourcesDirectory);
+            rebuildAllOutputs(currentState, outputJavaDirectory);
         } else {
-            Files.createDirectories(outJava);
-            Files.createDirectories(outRes);
-            clearDirectory(outRes);
-            applyResources(outRes);
-            current = rebuildIncremental(previous, outJava, inputChanges);
+            Files.createDirectories(outputJavaDirectory);
+            Files.createDirectories(outputResourcesDirectory);
+            clearDirectory(outputResourcesDirectory);
+            applyResources(outputResourcesDirectory);
+            currentState = rebuildIncremental(previousState, outputJavaDirectory, inputChanges);
         }
 
-        current.save(statePath, base);
+        currentState.save(stateFilePath, projectBasePath);
     }
 
-    private State scanAll() throws IOException {
-        State state = new State();
-        for (File root : getJavaSourceDirs().getFiles()) {
-            if (!root.isDirectory()) continue;
-            Path rootPath = root.toPath();
-            try (Stream<Path> stream = Files.walk(rootPath)) {
-                List<Path> files = stream
+    private SourceState scanAllSources() throws IOException {
+        SourceState state = new SourceState();
+        for (File sourceRoot : getJavaSourceDirs().getFiles()) {
+            if (!sourceRoot.isDirectory()) continue;
+
+            Path sourceRootPath = sourceRoot.toPath();
+            try (Stream<Path> pathStream = Files.walk(sourceRootPath)) {
+                List<Path> javaFiles = pathStream
                         .filter(Files::isRegularFile)
-                        .filter(p -> p.toString().endsWith(".java"))
-                        .sorted()
-                        .toList();
-                for (Path path : files) {
-                    Entry entry = scan(path);
-                    Entry existing = state.get(entry.fqn);
-                    if (existing != null && !existing.path.equals(entry.path)) {
-                        throw new GradleException("Duplicate class '" + entry.fqn + "' declared in:\n  "
-                                + existing.path + "\n  " + path);
+                        .filter(path -> path.toString().endsWith(".java")).sorted().toList();
+                for (Path javaFile : javaFiles) {
+                    SourceEntry entry = scanSourceFile(javaFile);
+                    SourceEntry existingEntry = state.get(entry.fqn);
+                    if (existingEntry != null && !existingEntry.path.equals(entry.path)) {
+                        throw new GradleException("Duplicate class '" + entry.fqn + "' declared in:\n  " + existingEntry.path + "\n  " + javaFile);
                     }
                     state.put(entry);
                 }
@@ -140,361 +144,501 @@ public abstract class AssembleSourcesTask extends DefaultTask {
         return state;
     }
 
-    private Entry scan(Path path) throws IOException {
+    private SourceEntry scanSourceFile(Path path) throws IOException {
         Path normalized = path.toAbsolutePath().normalize();
         String raw = Files.readString(normalized);
-        List<MergeDirective> directives = parseDirectives(raw);
-        Matcher m = PACKAGE_PATTERN.matcher(raw);
-        String pkg = m.find() ? m.group(1) : "";
-        String filename = normalized.getFileName().toString();
-        String simple = filename.substring(0, filename.length() - ".java".length());
-        String fqn = pkg.isEmpty() ? simple : pkg + "." + simple;
-        return new Entry(normalized, fqn, directives);
+        List<MergeDirective> mergeDirectives = parseMergeDirectives(raw);
+        List<PatchDirective> patchDirectives = parsePatchDirectives(raw);
+        boolean hasAsphodelMarkers = raw.contains("asphodel::merge")
+                || raw.contains("asphodel::patch")
+                || raw.contains("asphodel::import");
+        Matcher packageMatcher = PACKAGE_PATTERN.matcher(raw);
+        String packageName = packageMatcher.find() ? packageMatcher.group(1) : "";
+        String fileName = normalized.getFileName().toString();
+        String simpleClassName = fileName.substring(0, fileName.length() - ".java".length());
+        String fqn = packageName.isEmpty() ? simpleClassName : packageName + "." + simpleClassName;
+        return new SourceEntry(normalized, fqn, mergeDirectives, patchDirectives, hasAsphodelMarkers);
     }
 
-    private void rebuildAll(State state, Path outJava) throws IOException {
+    private void rebuildAllOutputs(SourceState state, Path outputJavaDirectory) throws IOException {
         Map<String, List<String>> contributions = resolveContributions(state);
-        Set<String> consumed = collectTargets(contributions, state);
-        for (String c : consumed) contributions.remove(c);
+        Set<String> consumedClassNames = collectTargets(contributions, state);
+        for (String consumedClassName : consumedClassNames) contributions.remove(consumedClassName);
 
-        Set<String> parseSet = new HashSet<>(contributions.keySet());
-        for (List<String> targets : contributions.values()) parseSet.addAll(targets);
-        parseAll(state, parseSet);
+        Set<String> classesToParse = new HashSet<>(contributions.keySet());
+        for (List<String> targetClassNames : contributions.values()) classesToParse.addAll(targetClassNames);
+        parseEntries(state, classesToParse);
 
-        CompilationUnitMerger merger = new CompilationUnitMerger();
-        for (Entry entry : state.all()) {
-            if (consumed.contains(entry.fqn)) continue;
-            writeOutput(merger, state, entry, contributions.get(entry.fqn), outJava);
+        CompilationUnitMerger unitMerger = new CompilationUnitMerger();
+        for (SourceEntry entry : state.all()) {
+            if (consumedClassNames.contains(entry.fqn)) continue;
+            writeOutput(unitMerger, state, entry, contributions.get(entry.fqn), outputJavaDirectory);
         }
     }
 
-    private State rebuildIncremental(State previous, Path outJava, InputChanges inputChanges) throws IOException {
-        State current = new State();
-        for (Entry entry : previous.all()) current.put(new Entry(entry.path, entry.fqn, entry.directives));
-
-        Set<String> changedFQNs = new HashSet<>();
-        Set<String> removedFQNs = new HashSet<>();
-
-        List<FileChange> changes = new ArrayList<>();
-        for (FileChange c : inputChanges.getFileChanges(getJavaSourceDirs())) {
-            changes.add(c);
+    private SourceState rebuildIncremental(SourceState previousState, Path outputJavaDirectory, InputChanges inputChanges) throws IOException {
+        SourceState currentState = new SourceState();
+        for (SourceEntry previousEntry : previousState.all()) {
+            currentState.put(new SourceEntry(previousEntry.path, previousEntry.fqn, previousEntry.mergeDirectives, previousEntry.patchDirectives, previousEntry.hasAsphodelMarkers));
         }
 
-        for (FileChange change : changes) {
-            File file = change.getFile();
-            if (!file.getName().endsWith(".java")) continue;
-            Path path = file.toPath().toAbsolutePath().normalize();
+        Set<String> changedClassNames = new HashSet<>();
+        Set<String> removedClassNames = new HashSet<>();
 
-            if (change.getChangeType() == ChangeType.REMOVED) {
-                Entry prev = current.getByPath(path);
-                if (prev != null) {
-                    current.remove(prev.fqn);
-                    removedFQNs.add(prev.fqn);
+        for (FileChange fileChange : inputChanges.getFileChanges(getJavaSourceDirs())) {
+            File changedFile = fileChange.getFile();
+            if (!changedFile.getName().endsWith(".java")) continue;
+
+            Path changedpath = changedFile.toPath().toAbsolutePath().normalize();
+
+            if (fileChange.getChangeType() == ChangeType.REMOVED) {
+                SourceEntry removedEntry = currentState.getByPath(changedpath);
+                if (removedEntry != null) {
+                    currentState.remove(removedEntry.fqn);
+                    removedClassNames.add(removedEntry.fqn);
                 }
             } else {
-                Entry old = current.getByPath(path);
-                if (old != null) {
-                    current.remove(old.fqn);
-                    changedFQNs.add(old.fqn);
+                SourceEntry previousEntry = currentState.getByPath(changedpath);
+                if (previousEntry != null) {
+                    currentState.remove(previousEntry.fqn);
+                    changedClassNames.add(previousEntry.fqn);
                 }
-                Entry entry = scan(path);
-                current.put(entry);
-                changedFQNs.add(entry.fqn);
+                SourceEntry newEntry = scanSourceFile(changedpath);
+                currentState.put(newEntry);
+                changedClassNames.add(newEntry.fqn);
             }
         }
 
-        Map<String, List<String>> prevContrib = resolveContributions(previous);
-        Map<String, List<String>> currContrib = resolveContributions(current);
-        Set<String> prevConsumed = collectTargets(prevContrib, previous);
-        Set<String> currConsumed = collectTargets(currContrib, current);
+        Map<String, List<String>> previousContributions = resolveContributions(previousState);
+        Map<String, List<String>> currentContributions = resolveContributions(currentState);
+        Set<String> previousConsumedClassNames = collectTargets(previousContributions, previousState);
+        Set<String> currentConsumedClassNames = collectTargets(currentContributions, currentState);
 
-        Set<String> affected = new HashSet<>(changedFQNs);
-        for (String fqn : changedFQNs) {
-            affected.addAll(dependentsOf(prevContrib, fqn));
-            affected.addAll(dependentsOf(currContrib, fqn));
+        Set<String> affectedClassNames = new HashSet<>(changedClassNames);
+        for (String changedClassName : changedClassNames) {
+            affectedClassNames.addAll(dependentsOf(previousContributions, changedClassName));
+            affectedClassNames.addAll(dependentsOf(currentContributions, changedClassName));
         }
-        for (String fqn : removedFQNs) {
-            affected.addAll(dependentsOf(prevContrib, fqn));
-            affected.addAll(dependentsOf(currContrib, fqn));
+        for (String removedClassName : removedClassNames) {
+            affectedClassNames.addAll(dependentsOf(previousContributions, removedClassName));
+            affectedClassNames.addAll(dependentsOf(currentContributions, removedClassName));
         }
-        for (String fqn : prevConsumed) {
-            if (!currConsumed.contains(fqn)) affected.add(fqn);
-        }
-
-        Set<String> prevOutputs = new HashSet<>(previous.fqns());
-        prevOutputs.removeAll(prevConsumed);
-        Set<String> currOutputs = new HashSet<>(current.fqns());
-        currOutputs.removeAll(currConsumed);
-        for (String fqn : prevOutputs) {
-            if (!currOutputs.contains(fqn)) deleteOutput(outJava, fqn);
+        for (String previouslyConsumedClassName : previousConsumedClassNames) {
+            if (!currentConsumedClassNames.contains(previouslyConsumedClassName)) affectedClassNames.add(previouslyConsumedClassName);
         }
 
-        for (String fqn : currOutputs) {
-            Path dest = outJava.resolve(fqn.replace('.', '/') + ".java");
-            if (!Files.exists(dest)) affected.add(fqn);
+        Set<String> previousOutputClassNames = new HashSet<>(previousState.fqns());
+        previousOutputClassNames.removeAll(previousConsumedClassNames);
+        Set<String> currentOutputClassNames = new HashSet<>(currentState.fqns());
+        currentOutputClassNames.removeAll(currentConsumedClassNames);
+
+        for (String previousOutputClassName : previousOutputClassNames) {
+            if (!currentOutputClassNames.contains(previousOutputClassName)) deleteOutput(outputJavaDirectory, previousOutputClassName);
         }
 
-        Set<String> parseSet = new HashSet<>();
-        for (String fqn : affected) {
-            List<String> targets = currContrib.get(fqn);
-            if (targets != null) {
-                parseSet.add(fqn);
-                parseSet.addAll(targets);
+        for (String currentOutputClassName : currentOutputClassNames) {
+            Path destinationFile = outputJavaDirectory.resolve(currentOutputClassName.replace('.', '/') + ".java");
+            if (!Files.exists(destinationFile)) affectedClassNames.add(currentOutputClassName);
+        }
+
+        Set<String> classesToParse = new HashSet<>();
+        for (String affectedClassName : affectedClassNames) {
+            List<String> targetClassNames = currentContributions.get(affectedClassName);
+            if (targetClassNames != null) {
+                classesToParse.add(affectedClassName);
+                classesToParse.addAll(targetClassNames);
             }
         }
-        parseAll(current, parseSet);
+        parseEntries(currentState, classesToParse);
 
-        CompilationUnitMerger merger = new CompilationUnitMerger();
-        for (String fqn : affected) {
-            if (currConsumed.contains(fqn)) continue;
-            Entry entry = current.get(fqn);
+        CompilationUnitMerger unitMerger = new CompilationUnitMerger();
+        for (String affectedClassName : affectedClassNames) {
+            if (currentConsumedClassNames.contains(affectedClassName)) continue;
+            SourceEntry entry = currentState.get(affectedClassName);
             if (entry == null) continue;
-            writeOutput(merger, current, entry, currContrib.get(fqn), outJava);
+            writeOutput(unitMerger, currentState, entry, currentContributions.get(affectedClassName), outputJavaDirectory);
         }
 
-        return current;
+        return currentState;
     }
 
-    private void writeOutput(CompilationUnitMerger merger, State state, Entry entry, List<String> targets, Path outJava) throws IOException {
-        Path dest = outJava.resolve(entry.fqn.replace('.', '/') + ".java");
-        Files.createDirectories(dest.getParent());
-        if (targets == null || targets.isEmpty()) {
-            Files.copy(entry.path, dest, StandardCopyOption.REPLACE_EXISTING);
+    private void writeOutput(CompilationUnitMerger unitMerger, SourceState state, SourceEntry entry,
+                             List<String> targetClassNames, Path outputJavaDirectory) throws IOException {
+        Path destinationFile = outputJavaDirectory.resolve(entry.fqn.replace('.', '/') + ".java");
+        Files.createDirectories(destinationFile.getParent());
+        if (targetClassNames == null || targetClassNames.isEmpty()) {
+            if (entry.hasAnyDirectives()) {
+                ensurePatchedSource(entry);
+                Files.writeString(destinationFile, entry.patchedSource);
+            } else {
+                Files.copy(entry.path, destinationFile, StandardCopyOption.REPLACE_EXISTING);
+            }
             return;
         }
-        CompilationUnitMerger.SourceFile primary = new CompilationUnitMerger.SourceFile(entry.path, entry.unit, entry.directives, entry.fqn, null);
-        List<CompilationUnitMerger.SourceFile> parts = new ArrayList<>(targets.size());
-        for (String target : targets) {
-            Entry targetEntry = state.get(target);
-            parts.add(new CompilationUnitMerger.SourceFile(targetEntry.path, targetEntry.unit, targetEntry.directives, targetEntry.fqn, null));
+        ensurePatchedSource(entry);
+        parseEntryIfNeeded(entry);
+        CompilationUnitMerger.SourceFile primarySourceFile = new CompilationUnitMerger.SourceFile(entry.path, entry.parsedUnit, entry.patchedSource);
+
+        List<CompilationUnitMerger.SourceFile> contributionSourceFiles = new ArrayList<>(targetClassNames.size());
+        for (String targetClassName : targetClassNames) {
+            SourceEntry targetEntry = state.get(targetClassName);
+            ensurePatchedSource(targetEntry);
+            parseEntryIfNeeded(targetEntry);
+            contributionSourceFiles.add(new CompilationUnitMerger.SourceFile(targetEntry.path, targetEntry.parsedUnit, targetEntry.patchedSource));
         }
-        Files.writeString(dest, merger.merge(primary, parts).toString());
+        Files.writeString(destinationFile, unitMerger.merge(primarySourceFile, contributionSourceFiles).toString());
     }
 
-    private void parseAll(State state, Set<String> parseSet) {
-        for (String fqn : parseSet) {
-            Entry entry = state.get(fqn);
-            if (entry == null || entry.unit != null) continue;
+    private void ensurePatchedSource(SourceEntry entry) throws IOException {
+        if (entry.patchedSource != null) return;
+
+        String rawSource = Files.readString(entry.path);
+        PatchTransformer.Result patchResult = PatchTransformer.transform(rawSource, entry.patchDirectives, getTargetLoader().get(), getTargetVersion().get());
+        for (String warning : patchResult.warnings()) getLogger().warn("[{}] {}", entry.fqn, warning);
+
+        ImportTransformer.Result importResult = ImportTransformer.transform(patchResult.source(), getTargetLoader().get(), getTargetVersion().get());
+        for (String warning : importResult.warnings()) getLogger().warn("[{}] {}", entry.fqn, warning);
+
+        entry.patchedSource = importResult.source();
+    }
+
+    private void parseEntryIfNeeded(SourceEntry entry) {
+        if (entry.parsedUnit != null) return;
+
+        try {
+            entry.parsedUnit = StaticJavaParser.parse(entry.patchedSource);
+        } catch (Exception parseException) {
+            throw new GradleException("Failed to parse " + entry.path + ": " + parseException.getMessage(), parseException);
+        }
+    }
+
+    private void parseEntries(SourceState state, Set<String> classNamesToParse) {
+        for (String className : classNamesToParse) {
+            SourceEntry entry = state.get(className);
+            if (entry == null) continue;
+
             try {
-                entry.unit = StaticJavaParser.parse(Files.readString(entry.path));
-            } catch (Exception ex) {
-                throw new GradleException("Failed to parse " + entry.path + ": " + ex.getMessage(), ex);
+                ensurePatchedSource(entry);
+            } catch (IOException readException) {
+                throw new GradleException("Failed to read " + entry.path + ": "
+                        + readException.getMessage(), readException);
             }
+            parseEntryIfNeeded(entry);
         }
     }
 
-    private Map<String, List<String>> resolveContributions(State state) {
+    private Map<String, List<String>> resolveContributions(SourceState state) {
         String loader = getTargetLoader().get();
         String version = getTargetVersion().get();
-        Map<String, List<String>> out = new LinkedHashMap<>();
-        for (Entry entry : state.all()) {
-            if (entry.directives.isEmpty()) continue;
-            List<String> matches = new ArrayList<>();
-            for (MergeDirective d : entry.directives) if (d.matches(loader, version)) matches.add(d.targetFqn());
-            if (!matches.isEmpty()) out.put(entry.fqn, matches);
+        Map<String, List<String>> contributions = new LinkedHashMap<>();
+        for (SourceEntry entry : state.all()) {
+            if (entry.mergeDirectives.isEmpty()) continue;
+
+            List<String> matchingTargetClassNames = new ArrayList<>();
+            for (MergeDirective mergeDirective : entry.mergeDirectives) {
+                if (mergeDirective.matches(loader, version)) matchingTargetClassNames.add(mergeDirective.targetFqn());
+            }
+            if (!matchingTargetClassNames.isEmpty()) contributions.put(entry.fqn, matchingTargetClassNames);
         }
-        return out;
+        return contributions;
     }
 
-    private static Set<String> collectTargets(Map<String, List<String>> contributions, State state) {
-        Set<String> out = new HashSet<>();
-        for (Map.Entry<String, List<String>> entry : contributions.entrySet()) {
-            for (String target : entry.getValue()) {
-                if (!state.contains(target)) throw new GradleException("Merge directive in '" + entry.getKey()
-                        + "' references unknown class '" + target + "'");
-                out.add(target);
+    private static Set<String> collectTargets(Map<String, List<String>> contributions, SourceState state) {
+        Set<String> targetClassNames = new HashSet<>();
+        for (Map.Entry<String, List<String>> contributionEntry : contributions.entrySet()) {
+            for (String targetClassName : contributionEntry.getValue()) {
+                if (!state.contains(targetClassName))
+                    throw new GradleException("Merge directive in '" + contributionEntry.getKey()
+                            + "' references unknown class '" + targetClassName + "'");
+                targetClassNames.add(targetClassName);
             }
         }
-        return out;
+        return targetClassNames;
     }
 
-    private static Set<String> dependentsOf(Map<String, List<String>> contributions, String fqn) {
-        Set<String> out = new HashSet<>();
-        for (Map.Entry<String, List<String>> e : contributions.entrySet()) if (e.getValue().contains(fqn)) out.add(e.getKey());
-        return out;
+    private static Set<String> dependentsOf(Map<String, List<String>> contributions, String targetClassName) {
+        Set<String> dependentClassNames = new HashSet<>();
+        for (Map.Entry<String, List<String>> contributionEntry : contributions.entrySet()) {
+            if (contributionEntry.getValue().contains(targetClassName)) dependentClassNames.add(contributionEntry.getKey());
+        }
+        return dependentClassNames;
     }
 
-    private static List<MergeDirective> parseDirectives(String source) {
-        List<MergeDirective> out = new ArrayList<>();
-        Matcher matcher = DIRECTIVE_PATTERN.matcher(source);
-        while (matcher.find()) out.add(new MergeDirective(matcher.group(1), matcher.group(2), matcher.group(3)));
-        return out;
+    private static List<MergeDirective> parseMergeDirectives(String source) {
+        List<MergeDirective> mergeDirectives = new ArrayList<>();
+        String normalizedSource = source.replace("\r\n", "\n").replace('\r', '\n');
+        for (String line : normalizedSource.split("\n")) {
+            MergeDirective mergeDirective = parseMergeDirective(line);
+            if (mergeDirective != null) mergeDirectives.add(mergeDirective);
+        }
+        return mergeDirectives;
     }
 
-    private void applyResources(Path outRes) throws IOException {
-        Set<String> copied = new HashSet<>();
-        copyTree(getLoaderResourcesDir(), outRes, copied);
-        copyTree(getVersionResourcesDir(), outRes, copied);
-        copyTree(getMainResourcesDir(), outRes, copied);
+    private static MergeDirective parseMergeDirective(String line) {
+        Matcher directiveMatcher = MERGE_DIRECTIVE_PATTERN.matcher(line);
+        if (!directiveMatcher.matches()) return null;
+
+        String directiveBody = directiveMatcher.group(1);
+        String conditionSegment = null;
+        String targetClassName = directiveBody;
+        int lastArrowIndex = directiveBody.lastIndexOf("->");
+        if (lastArrowIndex >= 0) {
+            conditionSegment = directiveBody.substring(0, lastArrowIndex).trim();
+            targetClassName = directiveBody.substring(lastArrowIndex + 2).trim();
+        }
+        if (!FULLY_QUALIFIED_NAME_PATTERN.matcher(targetClassName).matches()) return null;
+
+        String loaderPattern = null;
+        String versionPattern = null;
+        if (conditionSegment != null && !conditionSegment.isEmpty()) {
+            for (String rawCondition : conditionSegment.split(",")) {
+                String trimmedCondition = rawCondition.trim();
+                if (trimmedCondition.isEmpty()) continue;
+
+                int equalsIndex = trimmedCondition.indexOf('=');
+                if (equalsIndex < 0) continue;
+
+                String key = trimmedCondition.substring(0, equalsIndex).trim().toLowerCase();
+                String value = trimmedCondition.substring(equalsIndex + 1).trim();
+                if (value.isEmpty()) continue;
+
+                switch (key) {
+                    case "loader" -> loaderPattern = value;
+                    case "version" -> versionPattern = value;
+                    default -> {}
+                }
+            }
+        }
+        return new MergeDirective(loaderPattern, versionPattern, targetClassName);
     }
 
-    private void copyTree(ConfigurableFileCollection roots, Path outRes, Set<String> copied) throws IOException {
-        for (File root : roots.getFiles()) {
-            if (!root.isDirectory()) continue;
-            Path rootPath = root.toPath();
-            try (Stream<Path> stream = Files.walk(rootPath)) {
-                for (Path path : stream.filter(Files::isRegularFile).sorted().toList()) {
-                    String relative = rootPath.relativize(path).toString().replace(File.separatorChar, '/');
-                    if (!copied.add(relative)) continue;
-                    Path destination = outRes.resolve(relative);
-                    Files.createDirectories(destination.getParent());
-                    Files.copy(path, destination, StandardCopyOption.REPLACE_EXISTING);
+    private static List<PatchDirective> parsePatchDirectives(String source) {
+        List<PatchDirective> patchDirectives = new ArrayList<>();
+        String normalizedSource = source.replace("\r\n", "\n").replace('\r', '\n');
+        for (String line : normalizedSource.split("\n")) {
+            PatchDirective patchDirective = PatchTransformer.parseDirective(line);
+            if (patchDirective != null) patchDirectives.add(patchDirective);
+        }
+        return patchDirectives;
+    }
+
+    private void applyResources(Path outputResourcesDirectory) throws IOException {
+        Set<String> copiedRelativePaths = new HashSet<>();
+        copyDirectoryTree(getLoaderResourcesDir(), outputResourcesDirectory, copiedRelativePaths);
+        copyDirectoryTree(getVersionResourcesDir(), outputResourcesDirectory, copiedRelativePaths);
+        copyDirectoryTree(getMainResourcesDir(), outputResourcesDirectory, copiedRelativePaths);
+    }
+
+    private void copyDirectoryTree(ConfigurableFileCollection sourceRoots, Path outputResourcesDirectory, Set<String> copiedRelativePaths) throws IOException {
+        for (File sourceRoot : sourceRoots.getFiles()) {
+            if (!sourceRoot.isDirectory()) continue;
+
+            Path sourceRootPath = sourceRoot.toPath();
+            try (Stream<Path> pathStream = Files.walk(sourceRootPath)) {
+                for (Path sourceFile : pathStream.filter(Files::isRegularFile).sorted().toList()) {
+                    String relativePath = sourceRootPath.relativize(sourceFile).toString().replace(File.separatorChar, '/');
+                    if (!copiedRelativePaths.add(relativePath)) continue;
+
+                    Path destinationFile = outputResourcesDirectory.resolve(relativePath);
+                    Files.createDirectories(destinationFile.getParent());
+                    Files.copy(sourceFile, destinationFile, StandardCopyOption.REPLACE_EXISTING);
                 }
             }
         }
     }
 
-    private static void deleteOutput(Path outJava, String fqn) throws IOException {
-        Files.deleteIfExists(outJava.resolve(fqn.replace('.', '/') + ".java"));
+    private static void deleteOutput(Path outputJavaDirectory, String fullyQualifiedClassName) throws IOException {
+        Files.deleteIfExists(outputJavaDirectory.resolve(
+                fullyQualifiedClassName.replace('.', '/') + ".java"));
     }
 
-    private static void clearDirectory(Path root) throws IOException {
-        if (!Files.exists(root)) return;
-        try (Stream<Path> stream = Files.walk(root)) {
-            for (Path path : stream.filter(p -> !p.equals(root))
-                    .sorted(Comparator.reverseOrder())
-                    .toList()) {
-                Files.deleteIfExists(path);
-            }
+    private static void clearDirectory(Path directoryRoot) throws IOException {
+        if (!Files.exists(directoryRoot)) return;
+
+        try (Stream<Path> pathStream = Files.walk(directoryRoot)) {
+            for (Path path : pathStream.filter(currentPath -> !currentPath.equals(directoryRoot))
+                    .sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(path);
         }
     }
 
-    private static final class Entry {
+    private static final class SourceEntry {
         final Path path;
         final String fqn;
-        final List<MergeDirective> directives;
-        CompilationUnit unit;
+        final List<MergeDirective> mergeDirectives;
+        final List<PatchDirective> patchDirectives;
+        final boolean hasAsphodelMarkers;
+        CompilationUnit parsedUnit;
+        String patchedSource;
 
-        Entry(Path path, String fqn, List<MergeDirective> directives) {
+        SourceEntry(Path path, String fqn, List<MergeDirective> mergeDirectives, List<PatchDirective> patchDirectives, boolean hasAsphodelMarkers) {
             this.path = path;
             this.fqn = fqn;
-            this.directives = directives;
+            this.mergeDirectives = mergeDirectives;
+            this.patchDirectives = patchDirectives;
+            this.hasAsphodelMarkers = hasAsphodelMarkers;
+        }
+
+        boolean hasAnyDirectives() {
+            return hasAsphodelMarkers;
         }
     }
 
-    private static final class State {
-        private final Map<String, Entry> byFqn = new LinkedHashMap<>();
-        private final Map<String, Entry> byPath = new LinkedHashMap<>();
+    private static final class SourceState {
+        private final Map<String, SourceEntry> entriesByClassName = new LinkedHashMap<>();
+        private final Map<String, SourceEntry> entriesBypath = new LinkedHashMap<>();
 
-        Entry get(String fqn) {
-            return byFqn.get(fqn);
+        SourceEntry get(String fqn) {
+            return entriesByClassName.get(fqn);
         }
 
-        Entry getByPath(Path p) {
-            return byPath.get(p.toString());
+        SourceEntry getByPath(Path path) {
+            return entriesBypath.get(path.toString());
         }
 
         boolean contains(String fqn) {
-            return byFqn.containsKey(fqn);
+            return entriesByClassName.containsKey(fqn);
         }
 
-        Iterable<Entry> all() {
-            return byFqn.values();
+        Iterable<SourceEntry> all() {
+            return entriesByClassName.values();
         }
 
         Set<String> fqns() {
-            return byFqn.keySet();
+            return entriesByClassName.keySet();
         }
 
-        void put(Entry entry) {
-            Entry old = byFqn.get(entry.fqn);
-            if (old != null) byPath.remove(old.path.toString());
-            byFqn.put(entry.fqn, entry);
-            byPath.put(entry.path.toString(), entry);
+        void put(SourceEntry entry) {
+            SourceEntry previousEntry = entriesByClassName.get(entry.fqn);
+            if (previousEntry != null) entriesBypath.remove(previousEntry.path.toString());
+
+            entriesByClassName.put(entry.fqn, entry);
+            entriesBypath.put(entry.path.toString(), entry);
         }
 
         void remove(String fqn) {
-            Entry entry = byFqn.remove(fqn);
-            if (entry != null) byPath.remove(entry.path.toString());
+            SourceEntry removedEntry = entriesByClassName.remove(fqn);
+            if (removedEntry != null) entriesBypath.remove(removedEntry.path.toString());
         }
 
-        void save(Path path, Path base) throws IOException {
-            StringBuilder sb = new StringBuilder();
-            sb.append("v\t").append(STATE_VERSION).append('\n');
-            for (Entry entry : byFqn.values()) {
-                sb.append("entry\t").append(entry.fqn).append('\t')
-                        .append(escape(toStatePath(base, entry.path))).append('\t')
-                        .append(entry.directives.size());
-                for (MergeDirective d : entry.directives) {
-                    sb.append('\t').append(d.loader()).append('\t')
-                            .append(d.version()).append('\t').append(d.targetFqn());
+        void save(Path stateFilePath, Path projectBasePath) throws IOException {
+            StringBuilder stateBuilder = new StringBuilder();
+            stateBuilder.append("v\t").append(STATE_VERSION).append('\n');
+            for (SourceEntry entry : entriesByClassName.values()) {
+                stateBuilder.append("entry\t").append(entry.fqn).append('\t')
+                        .append(escapeStateField(toRelativeStatePath(projectBasePath, entry.path)))
+                        .append('\t')
+                        .append(entry.hasAsphodelMarkers ? "true" : "false")
+                        .append('\t')
+                        .append(entry.mergeDirectives.size());
+                for (MergeDirective mergeDirective : entry.mergeDirectives) {
+                    stateBuilder.append('\t')
+                            .append(mergeDirective.loader() == null ? "" : mergeDirective.loader())
+                            .append('\t')
+                            .append(mergeDirective.version() == null ? "" : mergeDirective.version())
+                            .append('\t')
+                            .append(mergeDirective.targetFqn());
                 }
-                sb.append('\n');
+                stateBuilder.append('\t').append(entry.patchDirectives.size());
+                for (PatchDirective patchDirective : entry.patchDirectives) {
+                    stateBuilder.append('\t')
+                            .append(patchDirective.loader() == null ? "" : patchDirective.loader())
+                            .append('\t')
+                            .append(patchDirective.version() == null ? "" : patchDirective.version())
+                            .append('\t')
+                            .append(patchDirective.id());
+                }
+                stateBuilder.append('\n');
             }
-            Files.createDirectories(path.getParent());
-            Files.writeString(path, sb.toString());
+            Files.createDirectories(stateFilePath.getParent());
+            Files.writeString(stateFilePath, stateBuilder.toString());
         }
 
-        static State load(Path path, Path base) {
-            if (!Files.exists(path)) return null;
+        static SourceState load(Path stateFilePath, Path projectBasePath) {
+            if (!Files.exists(stateFilePath)) return null;
+
             try {
-                List<String> lines = Files.readAllLines(path);
-                if (lines.isEmpty()) return null;
-                String[] header = lines.getFirst().split("\t", -1);
-                if (header.length != 2 || !header[0].equals("v")
-                        || Integer.parseInt(header[1]) != STATE_VERSION) return null;
-                State s = new State();
-                for (int i = 1; i < lines.size(); i++) {
-                    String[] parts = lines.get(i).split("\t", -1);
-                    if (parts.length < 4 || !parts[0].equals("entry")) continue;
-                    Path entryPath = fromStatePath(base, unescape(parts[2]));
-                    int n = Integer.parseInt(parts[3]);
-                    List<MergeDirective> directives = new ArrayList<>(n);
-                    int idx = 4;
-                    for (int j = 0; j < n; j++) {
-                        directives.add(new MergeDirective(parts[idx], parts[idx + 1], parts[idx + 2]));
-                        idx += 3;
+                List<String> stateLines = Files.readAllLines(stateFilePath);
+                if (stateLines.isEmpty()) return null;
+
+                String[] headerFields = stateLines.get(0).split("\t", -1);
+                if (headerFields.length != 2 || !headerFields[0].equals("v") || Integer.parseInt(headerFields[1]) != STATE_VERSION) return null;
+
+                SourceState loadedState = new SourceState();
+                for (int lineIndex = 1; lineIndex < stateLines.size(); lineIndex++) {
+                    String[] fields = stateLines.get(lineIndex).split("\t", -1);
+                    if (fields.length < 6 || !fields[0].equals("entry")) continue;
+
+                    Path entrypath = fromRelativeStatePath(projectBasePath, unescapeStateField(fields[2]));
+                    boolean hasAsphodelMarkers = Boolean.parseBoolean(fields[3]);
+                    int mergeDirectiveCount = Integer.parseInt(fields[4]);
+                    List<MergeDirective> mergeDirectives = new ArrayList<>(mergeDirectiveCount);
+                    int fieldIndex = 5;
+                    for (int mergeIndex = 0; mergeIndex < mergeDirectiveCount; mergeIndex++) {
+                        String loaderPattern = fields[fieldIndex].isEmpty() ? null : fields[fieldIndex];
+                        String versionPattern = fields[fieldIndex + 1].isEmpty() ? null : fields[fieldIndex + 1];
+                        mergeDirectives.add(new MergeDirective(loaderPattern, versionPattern, fields[fieldIndex + 2]));
+                        fieldIndex += 3;
                     }
-                    s.put(new Entry(entryPath, parts[1], directives));
+                    if (fieldIndex >= fields.length) continue;
+
+                    int patchDirectiveCount = Integer.parseInt(fields[fieldIndex++]);
+                    List<PatchDirective> patchDirectives = new ArrayList<>(patchDirectiveCount);
+                    for (int patchIndex = 0; patchIndex < patchDirectiveCount; patchIndex++) {
+                        String loaderPattern = fields[fieldIndex].isEmpty() ? null : fields[fieldIndex];
+                        String versionPattern = fields[fieldIndex + 1].isEmpty() ? null : fields[fieldIndex + 1];
+                        patchDirectives.add(new PatchDirective(loaderPattern, versionPattern, fields[fieldIndex + 2]));
+                        fieldIndex += 3;
+                    }
+                    loadedState.put(new SourceEntry(entrypath, fields[1], mergeDirectives, patchDirectives, hasAsphodelMarkers));
                 }
-                return s;
-            } catch (Exception ex) { return null; }
+                return loadedState;
+            } catch (Exception loadException) { return null; }
         }
 
-        private static String toStatePath(Path base, Path absolute) {
-            Path rel = base.relativize(absolute.toAbsolutePath().normalize());
-            return rel.toString().replace(File.separatorChar, '/');
+        private static String toRelativeStatePath(Path projectBasePath, Path absolutepath) {
+            Path relativePath = projectBasePath.relativize(absolutepath.toAbsolutePath().normalize());
+            return relativePath.toString().replace(File.separatorChar, '/');
         }
 
-        private static Path fromStatePath(Path base, String stored) {
-            String platformPath = stored.replace('/', File.separatorChar);
-            return base.resolve(platformPath).normalize();
+        private static Path fromRelativeStatePath(Path projectBasePath, String storedRelativePath) {
+            String platformPath = storedRelativePath.replace('/', File.separatorChar);
+            return projectBasePath.resolve(platformPath).normalize();
         }
 
-        private static String escape(String s) {
-            StringBuilder sb = new StringBuilder(s.length());
-            for (int i = 0; i < s.length(); i++) {
-                char c = s.charAt(i);
-                switch (c) {
-                    case '\\' -> sb.append("\\\\");
-                    case '\t' -> sb.append("\\t");
-                    case '\n' -> sb.append("\\n");
-                    case '\r' -> sb.append("\\r");
-                    default -> sb.append(c);
+        private static String escapeStateField(String rawValue) {
+            StringBuilder escapedBuilder = new StringBuilder(rawValue.length());
+            for (int characterIndex = 0; characterIndex < rawValue.length(); characterIndex++) {
+                char currentCharacter = rawValue.charAt(characterIndex);
+                switch (currentCharacter) {
+                    case '\\' -> escapedBuilder.append("\\\\");
+                    case '\t' -> escapedBuilder.append("\\t");
+                    case '\n' -> escapedBuilder.append("\\n");
+                    case '\r' -> escapedBuilder.append("\\r");
+                    default -> escapedBuilder.append(currentCharacter);
                 }
             }
-            return sb.toString();
+            return escapedBuilder.toString();
         }
 
-        private static String unescape(String s) {
-            StringBuilder sb = new StringBuilder(s.length());
-            for (int i = 0; i < s.length(); i++) {
-                char c = s.charAt(i);
-                if (c == '\\' && i + 1 < s.length()) {
-                    char n = s.charAt(++i);
-                    switch (n) {
-                        case '\\' -> sb.append('\\');
-                        case 't' -> sb.append('\t');
-                        case 'n' -> sb.append('\n');
-                        case 'r' -> sb.append('\r');
+        private static String unescapeStateField(String escapedValue) {
+            StringBuilder unescapedBuilder = new StringBuilder(escapedValue.length());
+            for (int characterIndex = 0; characterIndex < escapedValue.length(); characterIndex++) {
+                char currentCharacter = escapedValue.charAt(characterIndex);
+                if (currentCharacter == '\\' && characterIndex + 1 < escapedValue.length()) {
+                    char escapedCharacter = escapedValue.charAt(++characterIndex);
+                    switch (escapedCharacter) {
+                        case '\\' -> unescapedBuilder.append('\\');
+                        case 't' -> unescapedBuilder.append('\t');
+                        case 'n' -> unescapedBuilder.append('\n');
+                        case 'r' -> unescapedBuilder.append('\r');
                         default -> {
-                            sb.append('\\');
-                            sb.append(n);
+                            unescapedBuilder.append('\\');
+                            unescapedBuilder.append(escapedCharacter);
                         }
                     }
-                } else sb.append(c);
+                } else unescapedBuilder.append(currentCharacter);
             }
-            return sb.toString();
+            return unescapedBuilder.toString();
         }
     }
 }
